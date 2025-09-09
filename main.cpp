@@ -395,6 +395,13 @@ void GStreamerRTSPServer::on_media_configure(GstRTSPMedia *media) {
         return;
     }
     
+    // Set pipeline clock to system clock for better timing
+    if (GST_IS_PIPELINE(pipeline)) {
+        GstClock *clock = gst_system_clock_obtain();
+        gst_pipeline_use_clock(GST_PIPELINE(pipeline), clock);
+        gst_object_unref(clock);
+    }
+    
     // Configure appsrc properties for YUYV stream
     GstCaps *caps = gst_caps_new_simple("video/x-raw",
         "format", G_TYPE_STRING, "YUY2",
@@ -464,17 +471,18 @@ gboolean GStreamerRTSPServer::push_frame_idle() {
         memcpy(map.data, frame.data, frame.size);
         gst_buffer_unmap(buffer, &map);
         
-        // Set proper timestamp based on system clock
+        // Set consistent timestamp for RTP timing
         static GstClockTime base_time = GST_CLOCK_TIME_NONE;
         static guint64 frame_count = 0;
+        
+        GstClockTime duration = GST_SECOND / CAPTURE_FPS;
         
         if (base_time == GST_CLOCK_TIME_NONE) {
             base_time = gst_util_get_timestamp();
         }
         
-        GstClockTime duration = GST_SECOND / CAPTURE_FPS;
-        GstClockTime current_time = gst_util_get_timestamp();
-        GstClockTime timestamp = current_time - base_time;
+        // Use frame-based timing for consistency
+        GstClockTime timestamp = frame_count * duration;
         
         GST_BUFFER_PTS(buffer) = timestamp;
         GST_BUFFER_DTS(buffer) = timestamp;
@@ -482,7 +490,7 @@ gboolean GStreamerRTSPServer::push_frame_idle() {
         GST_BUFFER_OFFSET(buffer) = frame_count;
         GST_BUFFER_OFFSET_END(buffer) = frame_count + 1;
         
-        // 버퍼를 live로 표시
+        // 버퍼를 live로 표시하고 동기화 가능하게 설정
         GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_LIVE);
         
         frame_count++;
