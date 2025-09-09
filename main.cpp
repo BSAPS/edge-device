@@ -124,13 +124,15 @@ public:
         GstRTSPMountPoints *mounts = gst_rtsp_server_get_mount_points(server_);
         GstRTSPMediaFactory *factory = gst_rtsp_media_factory_new();
 
-        const char* pipeline_str = "appsrc name=bsaps_src is-live=true do-timestamp=false format=GST_FORMAT_TIME block=false ! queue max-size-buffers=4 leaky=downstream ! videoconvert ! video/x-raw,format=I420 ! openh264enc bitrate=2000000 complexity=0 ! video/x-h264,profile=high,level=(string)4.1 ! h264parse config-interval=1 ! rtph264pay name=pay0 pt=96 config-interval=1 mtu=1400";
+        const char* pipeline_str = "( appsrc name=bsaps_src is-live=true do-timestamp=true format=GST_FORMAT_TIME block=false ! queue max-size-buffers=4 leaky=downstream ! videoconvert ! video/x-raw,format=I420 ! openh264enc bitrate=2000000 complexity=0 ! video/x-h264,profile=high,level=(string)4.1 ! h264parse config-interval=1 ! rtph264pay name=pay0 pt=96 config-interval=1 mtu=1400 )";
         gst_rtsp_media_factory_set_launch(factory, pipeline_str);
-        gst_rtsp_media_factory_set_shared(factory, TRUE);
-        gst_rtsp_media_factory_set_latency(factory, 0);
+        gst_rtsp_media_factory_set_shared(factory, FALSE);  // 각 연결마다 새로운 미디어 생성
+        gst_rtsp_media_factory_set_latency(factory, 100);
         gst_rtsp_media_factory_set_buffer_size(factory, 0);
         gst_rtsp_media_factory_set_protocols(factory, static_cast<GstRTSPLowerTrans>(GST_RTSP_LOWER_TRANS_UDP | GST_RTSP_LOWER_TRANS_TCP));
-        gst_rtsp_media_factory_set_stop_on_disconnect(factory, FALSE);
+        gst_rtsp_media_factory_set_stop_on_disconnect(factory, TRUE);  // 연결 해제시 중지
+        gst_rtsp_media_factory_set_enable_rtcp(factory, FALSE);  // RTCP 비활성화로 단순화
+        gst_rtsp_media_factory_set_eos_shutdown(factory, TRUE);  // EOS시 정리
         g_signal_connect(factory, "media-configure", (GCallback)media_configure_callback, this);
         
         gst_rtsp_mount_points_add_factory(mounts, RTSP_MOUNT_POINT, factory);
@@ -407,9 +409,9 @@ void GStreamerRTSPServer::on_media_configure(GstRTSPMedia *media) {
         "stream-type", GST_APP_STREAM_TYPE_STREAM,
         "format", GST_FORMAT_TIME,
         "is-live", TRUE,
-        "do-timestamp", FALSE,
-        "min-latency", G_GINT64_CONSTANT(0),
-        "max-latency", G_GINT64_CONSTANT(0),
+        "do-timestamp", TRUE,
+        "min-latency", G_GINT64_CONSTANT(33333333),  // ~30ms for 30fps
+        "max-latency", G_GINT64_CONSTANT(100000000), // 100ms
         "block", FALSE,
         "max-bytes", G_GUINT64_CONSTANT(0),
         "emit-signals", TRUE,
@@ -462,22 +464,26 @@ gboolean GStreamerRTSPServer::push_frame_idle() {
         memcpy(map.data, frame.data, frame.size);
         gst_buffer_unmap(buffer, &map);
         
-        // Set timestamp using running time
-        static GstClockTime start_time = GST_CLOCK_TIME_NONE;
+        // Set proper timestamp based on system clock
+        static GstClockTime base_time = GST_CLOCK_TIME_NONE;
         static guint64 frame_count = 0;
         
-        if (start_time == GST_CLOCK_TIME_NONE) {
-            start_time = gst_util_get_timestamp();
+        if (base_time == GST_CLOCK_TIME_NONE) {
+            base_time = gst_util_get_timestamp();
         }
         
         GstClockTime duration = GST_SECOND / CAPTURE_FPS;
-        GstClockTime timestamp = frame_count * duration;
+        GstClockTime current_time = gst_util_get_timestamp();
+        GstClockTime timestamp = current_time - base_time;
         
         GST_BUFFER_PTS(buffer) = timestamp;
         GST_BUFFER_DTS(buffer) = timestamp;
         GST_BUFFER_DURATION(buffer) = duration;
         GST_BUFFER_OFFSET(buffer) = frame_count;
         GST_BUFFER_OFFSET_END(buffer) = frame_count + 1;
+        
+        // 버퍼를 live로 표시
+        GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_LIVE);
         
         frame_count++;
         
