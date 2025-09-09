@@ -60,6 +60,16 @@ public:
         cv.notify_one();
     }
 
+    bool try_pop(T& value) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (data_queue.empty()) {
+            return false;
+        }
+        value = std::move(data_queue.front());
+        data_queue.pop();
+        return true;
+    }
+    
     bool wait_and_pop(T& value) {
         std::unique_lock<std::mutex> lock(mtx);
         cv.wait(lock, [this] { return !data_queue.empty() || stopped.load(); });
@@ -77,6 +87,8 @@ public:
     }
 };
 
+class CameraApp; // Forward declaration
+
 class GStreamerRTSPServer {
 private:
     GMainLoop *loop_;
@@ -84,8 +96,11 @@ private:
     GstAppSrc *appsrc_;
     std::thread server_thread_;
     std::atomic<bool> is_running_;
+    guint source_id_ = 0;
+    CameraApp *app_ = nullptr;
 
 public:
+    gboolean push_frame_idle();
     GStreamerRTSPServer() : loop_(nullptr), server_(nullptr), appsrc_(nullptr), is_running_(false) {
         gst_init(nullptr, nullptr);
     }
@@ -95,17 +110,27 @@ public:
         gst_deinit();
     }
 
-    bool start() {
+    bool start(CameraApp* app) {
+        app_ = app;
         loop_ = g_main_loop_new(NULL, FALSE);
         server_ = gst_rtsp_server_new();
-        g_object_set(server_, "service", std::to_string(RTSP_PORT).c_str(), NULL);
+        
+        // Set server properties
+        g_object_set(server_, 
+            "service", std::to_string(RTSP_PORT).c_str(),
+            "backlog", 5,
+            NULL);
         
         GstRTSPMountPoints *mounts = gst_rtsp_server_get_mount_points(server_);
         GstRTSPMediaFactory *factory = gst_rtsp_media_factory_new();
 
-        const char* pipeline_str = "appsrc name=bsaps_src format=time is-live=true do-timestamp=true caps=\"video/x-raw,format=BGR,width=1920,height=1080,framerate=30/1\" ! queue ! videoconvert ! video/x-raw,format=NV12 ! v4l2h264enc ! video/x-h264,level=(string)4.1,profile=high ! rtph264pay name=pay0 pt=96";
+        const char* pipeline_str = "appsrc name=bsaps_src is-live=true do-timestamp=false format=GST_FORMAT_TIME block=false ! queue max-size-buffers=4 leaky=downstream ! videoconvert ! video/x-raw,format=I420 ! openh264enc bitrate=2000000 complexity=0 ! video/x-h264,profile=high,level=(string)4.1 ! h264parse config-interval=1 ! rtph264pay name=pay0 pt=96 config-interval=1 mtu=1400";
         gst_rtsp_media_factory_set_launch(factory, pipeline_str);
         gst_rtsp_media_factory_set_shared(factory, TRUE);
+        gst_rtsp_media_factory_set_latency(factory, 0);
+        gst_rtsp_media_factory_set_buffer_size(factory, 0);
+        gst_rtsp_media_factory_set_protocols(factory, static_cast<GstRTSPLowerTrans>(GST_RTSP_LOWER_TRANS_UDP | GST_RTSP_LOWER_TRANS_TCP));
+        gst_rtsp_media_factory_set_stop_on_disconnect(factory, FALSE);
         g_signal_connect(factory, "media-configure", (GCallback)media_configure_callback, this);
         
         gst_rtsp_mount_points_add_factory(mounts, RTSP_MOUNT_POINT, factory);
@@ -135,6 +160,7 @@ public:
 
     void stop() {
         if (is_running_.exchange(false)) {
+            if (source_id_ > 0) g_source_remove(source_id_);
             if (loop_) g_main_loop_quit(loop_);
             if (server_thread_.joinable()) server_thread_.join();
             if (server_) g_object_unref(server_);
@@ -142,28 +168,12 @@ public:
         }
     }
 
-    void pushFrame(void* data, size_t size) {
-        if (!is_running_.load() || !appsrc_) return; 
-        
-        GstBuffer* buffer = gst_buffer_new_wrapped_full(GST_MEMORY_FLAG_READONLY, data, size, 0, size, nullptr, nullptr);
-
-        GstFlowReturn ret;
-        g_signal_emit_by_name(appsrc_, "push-buffer", buffer, &ret);
-        if (ret != GST_FLOW_OK) {
-             // gst_buffer_unref is called by g_signal_emit_by_name
-        }
-    }
-
 private:
-    static void media_configure_callback(GstRTSPMediaFactory *factory, GstRTSPMedia *media, gpointer user_data) {
-        GStreamerRTSPServer* self = static_cast<GStreamerRTSPServer*>(user_data);
-        self->on_media_configure(media);
-    }
+    static void media_configure_callback(GstRTSPMediaFactory *factory, GstRTSPMedia *media, gpointer user_data);
+    void on_media_configure(GstRTSPMedia *media);
 
-    void on_media_configure(GstRTSPMedia *media) {
-        GstElement *pipeline = gst_rtsp_media_get_element(media);
-        appsrc_ = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(pipeline), "bsaps_src"));
-    }
+    static void need_data_callback(GstElement *appsrc, guint unused, gpointer user_data);
+    static void enough_data_callback(GstElement *appsrc, gpointer user_data);
 };
 
 class CameraApp {
@@ -182,12 +192,12 @@ private:
     long long last_timestamp_ = 0;
 
     std::unique_ptr<GStreamerRTSPServer> rtsp_server_;
-    ThreadSafeQueue<FrameData> hr_frame_queue_;
     ThreadSafeQueue<FrameData> lr_frame_queue_;
-    std::thread hr_processing_thread_;
     std::thread lr_processing_thread_;
 
 public:
+    ThreadSafeQueue<FrameData> hr_frame_queue_;
+
     CameraApp() = default;
     ~CameraApp() { cleanup(); }
 
@@ -212,12 +222,17 @@ public:
 
     bool configure() {
         config_ = camera_->generateConfiguration({ StreamRole::VideoRecording, StreamRole::Viewfinder });
-        config_->at(0).pixelFormat = formats::BGR888;
+        
+        // Use YUYV for HR stream and convert in GStreamer
+        config_->at(0).pixelFormat = formats::YUYV;
         config_->at(0).size = Size(CAPTURE_WIDTH_HR, CAPTURE_HEIGHT_HR);
         config_->at(0).bufferCount = 8;
+        
+        // Configure YUYV stream for local processing (keep 480p as requested)
         config_->at(1).pixelFormat = formats::YUYV;
         config_->at(1).size = Size(CAPTURE_WIDTH_LR, CAPTURE_HEIGHT_LR);
         config_->at(1).bufferCount = 4;
+        
         if (config_->validate() == CameraConfiguration::Invalid || camera_->configure(config_.get()) < 0) return false;
 
         hr_stream_ = config_->at(0).stream();
@@ -238,9 +253,8 @@ public:
     }
 
     bool start() {
-        if (!rtsp_server_->start()) return false;
+        if (!rtsp_server_->start(this)) return false;
         
-        hr_processing_thread_ = std::thread(&CameraApp::process_hr_frames, this);
         lr_processing_thread_ = std::thread(&CameraApp::process_lr_frames, this);
         camera_->requestCompleted.connect(this, &CameraApp::onRequestCompleted);
 
@@ -275,7 +289,6 @@ public:
         hr_frame_queue_.stop();
         lr_frame_queue_.stop();
 
-        if (hr_processing_thread_.joinable()) hr_processing_thread_.join();
         if (lr_processing_thread_.joinable()) lr_processing_thread_.join();
         
         if (camera_) {
@@ -334,17 +347,6 @@ private:
         if (camera_ && !stopping_.load()) camera_->queueRequest(request);
     }
 
-    void process_hr_frames() {
-        while (!stopping_.load()) {
-            FrameData frame;
-            if (hr_frame_queue_.wait_and_pop(frame)) {
-                rtsp_server_->pushFrame(frame.data, frame.size);
-            }
-        }
-        std::lock_guard<std::mutex> lock(log_mutex);
-        std::cout << "[INFO] HR frame processing thread finished." << std::endl;
-    }
-
     void process_lr_frames() {
         int frame_count = 0;
         while (!stopping_.load()) {
@@ -380,6 +382,135 @@ private:
         }
     }
 };
+
+// GStreamer RTSP Server Method Implementations
+void GStreamerRTSPServer::on_media_configure(GstRTSPMedia *media) {
+    GstElement *pipeline = gst_rtsp_media_get_element(media);
+    appsrc_ = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(pipeline), "bsaps_src"));
+    
+    if (!appsrc_) {
+        g_print("Failed to get appsrc element\n");
+        return;
+    }
+    
+    // Configure appsrc properties for YUYV stream
+    GstCaps *caps = gst_caps_new_simple("video/x-raw",
+        "format", G_TYPE_STRING, "YUY2",
+        "width", G_TYPE_INT, CAPTURE_WIDTH_HR,
+        "height", G_TYPE_INT, CAPTURE_HEIGHT_HR,
+        "framerate", GST_TYPE_FRACTION, CAPTURE_FPS, 1,
+        "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
+        NULL);
+    
+    g_object_set(G_OBJECT(appsrc_),
+        "caps", caps,
+        "stream-type", GST_APP_STREAM_TYPE_STREAM,
+        "format", GST_FORMAT_TIME,
+        "is-live", TRUE,
+        "do-timestamp", FALSE,
+        "min-latency", G_GINT64_CONSTANT(0),
+        "max-latency", G_GINT64_CONSTANT(0),
+        "block", FALSE,
+        "max-bytes", G_GUINT64_CONSTANT(0),
+        "emit-signals", TRUE,
+        NULL);
+    gst_caps_unref(caps);
+    
+    g_signal_connect(appsrc_, "need-data", (GCallback)need_data_callback, this);
+    g_signal_connect(appsrc_, "enough-data", (GCallback)enough_data_callback, this);
+}
+
+void GStreamerRTSPServer::media_configure_callback(GstRTSPMediaFactory *factory, GstRTSPMedia *media, gpointer user_data) {
+    static_cast<GStreamerRTSPServer*>(user_data)->on_media_configure(media);
+}
+
+static gboolean push_frame_idle_wrapper(gpointer user_data) {
+    if (!user_data) return G_SOURCE_REMOVE;
+    GStreamerRTSPServer* server = static_cast<GStreamerRTSPServer*>(user_data);
+    if (!server) return G_SOURCE_REMOVE;
+    return server->push_frame_idle();
+}
+
+gboolean GStreamerRTSPServer::push_frame_idle() {
+    if (!appsrc_ || !app_) {
+        return G_SOURCE_REMOVE;
+    }
+    
+    // Check if appsrc is still valid GStreamer object
+    if (!GST_IS_APP_SRC(appsrc_)) {
+        return G_SOURCE_REMOVE;
+    }
+    
+    FrameData frame;
+    if (app_->hr_frame_queue_.try_pop(frame)) {
+        if (!frame.data || frame.size == 0) {
+            return G_SOURCE_CONTINUE;
+        }
+        
+        // Create buffer with proper timestamp
+        GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame.size, nullptr);
+        if (!buffer) {
+            return G_SOURCE_CONTINUE;
+        }
+        
+        GstMapInfo map;
+        if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+            gst_buffer_unref(buffer);
+            return G_SOURCE_CONTINUE;
+        }
+        
+        memcpy(map.data, frame.data, frame.size);
+        gst_buffer_unmap(buffer, &map);
+        
+        // Set timestamp using running time
+        static GstClockTime start_time = GST_CLOCK_TIME_NONE;
+        static guint64 frame_count = 0;
+        
+        if (start_time == GST_CLOCK_TIME_NONE) {
+            start_time = gst_util_get_timestamp();
+        }
+        
+        GstClockTime duration = GST_SECOND / CAPTURE_FPS;
+        GstClockTime timestamp = frame_count * duration;
+        
+        GST_BUFFER_PTS(buffer) = timestamp;
+        GST_BUFFER_DTS(buffer) = timestamp;
+        GST_BUFFER_DURATION(buffer) = duration;
+        GST_BUFFER_OFFSET(buffer) = frame_count;
+        GST_BUFFER_OFFSET_END(buffer) = frame_count + 1;
+        
+        frame_count++;
+        
+        GstFlowReturn ret;
+        g_signal_emit_by_name(appsrc_, "push-buffer", buffer, &ret);
+        
+        if (ret != GST_FLOW_OK && ret != GST_FLOW_FLUSHING) {
+            return G_SOURCE_REMOVE;
+        }
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+void GStreamerRTSPServer::need_data_callback(GstElement *appsrc, guint unused, gpointer user_data) {
+    if (!user_data) return;
+    GStreamerRTSPServer* self = static_cast<GStreamerRTSPServer*>(user_data);
+    if (!self || !self->is_running_.load()) return;
+    
+    if (self->source_id_ == 0) {
+        self->source_id_ = g_idle_add(push_frame_idle_wrapper, user_data);
+    }
+}
+
+void GStreamerRTSPServer::enough_data_callback(GstElement *appsrc, gpointer user_data) {
+    if (!user_data) return;
+    GStreamerRTSPServer* self = static_cast<GStreamerRTSPServer*>(user_data);
+    if (!self || !self->is_running_.load()) return;
+    
+    if (self->source_id_ != 0) {
+        g_source_remove(self->source_id_);
+        self->source_id_ = 0;
+    }
+}
 
 static std::atomic<bool> should_exit{false};
 static CameraApp* app_instance = nullptr;
@@ -417,6 +548,8 @@ int main() {
         std::cerr << "[FATAL] An unhandled exception occurred: " << e.what() << std::endl;
         return -1;
     }
+    
+    std::this_thread::sleep_for(500ms); // Final delay for GStreamer cleanup
     {
         std::lock_guard<std::mutex> lock(log_mutex);
         std::cout << "[INFO] Application terminated." << std::endl;
